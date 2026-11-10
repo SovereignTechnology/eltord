@@ -673,8 +673,10 @@ def patch_torrcs(topo):
             lines += [f"ElTorFoundationTerms {eltor_terms(topo['paid'][d['nick']], max_periods=topo['periods'])}",
                       f"PaymentBolt12Offer {topo['offers'][d['nick']]}"]
         if d["role"] == "client":
+            # MaxCircuitDirtiness as eltord's sample torrc: with Tor's 600 s default the client closes its own
+            # paid circuit at the first 10-round renewal once it is idle (el-tor/eltor#12).
             lines += ["__ElTorRequirePaidStreams 1", "UseEntryGuards 0", "LearnCircuitBuildTimeout 0",
-                      "CircuitBuildTimeout 15"]
+                      "CircuitBuildTimeout 15", "MaxCircuitDirtiness 86400"]
         torrc_append(dirs[d["nick"]], "foundation", lines)
 
 
@@ -719,11 +721,19 @@ def fetch(nbytes, client="client", seed=None, rate=0, timeout=120):
 # ----------------------------------------------------------------------------------------------- money
 def money(topo):
     """Settlement evidence straight from CLN: what the payer completed vs what each paid relay received."""
-    pays = [p for p in ln("payer", "listpays")["pays"] if p.get("status") == "complete"]
-    sent = sum(int(str(p.get("amount_sent_msat", 0)).removesuffix("msat")) for p in pays)
-    out = {"payer_complete": len(pays), "payer_sent_msat": sent, "relays": {}}
+    try:                                # a fault scenario may have the payer stopped on purpose
+        pays = [p for p in ln("payer", "listpays", timeout=15)["pays"] if p.get("status") == "complete"]
+        out = {"payer_complete": len(pays), "relays": {},
+               "payer_sent_msat": sum(int(str(p.get("amount_sent_msat", 0)).removesuffix("msat")) for p in pays)}
+    except Exception:  # noqa: BLE001
+        out = {"payer_complete": None, "payer_sent_msat": None, "payer_unreachable": True, "relays": {}}
     for nick in topo["paid"]:
-        inv = [i for i in ln(topo["relay_ln"][nick], "listinvoices")["invoices"] if i.get("status") == "paid"]
+        try:                            # a fault scenario may have this relay's CLN stopped on purpose
+            invoices = ln(topo["relay_ln"][nick], "listinvoices", timeout=15)["invoices"]
+        except Exception:  # noqa: BLE001
+            out["relays"][nick] = {"unreachable": True}
+            continue
+        inv = [i for i in invoices if i.get("status") == "paid"]
         out["relays"][nick] = {"paid_invoices": len(inv), "received_msat": sum(
             int(str(i.get("amount_received_msat", 0)).removesuffix("msat")) for i in inv)}
     return out
@@ -778,9 +788,16 @@ def cmd_up(a):
     log(f"tor: relays + 005c bootstrapped; ordinary client {plain['nick']} at {bootstrap_pct(plain['num'], topo)}%")
     controllers_up(topo)
     log("controllers: relays + client attached; probing the paid path through 005c")
-    t0 = time.time()
-    res = wait_for("a checksummed fetch through the paid-only client", lambda: (lambda r: r if r["ok"] else None)(
-        fetch(4096, timeout=30)), timeout=a.timeout, every=5)
+    t0, res = time.time(), None
+    while time.time() - t0 < 120 and res is None:
+        r = fetch(4096, timeout=30)
+        res = r if r["ok"] else None
+        if res is None:
+            time.sleep(5)
+    if res is None:                     # a claimed scope is never rebuilt (el-tor/eltord#17): start a fresh one
+        log("no paid path within 120 s on the existing scope: rescoping")
+        res, attempts = fresh_path()
+        log(f"fresh scope needed {attempts} attempt(s)")
     log(f"PAID PATH UP after {time.time() - t0:.0f}s: {json.dumps(res)}")
     log(f"settlement: {json.dumps(money(topo))}")
 
@@ -902,9 +919,7 @@ def scenario_renewal(a):
     topo = load_topo()
     nick = next(iter(topo["paid"]))
     # Start from a fresh construction so the stream covers rounds 1..N of one known circuit.
-    cmd_controllers(argparse.Namespace(rescope=True))
-    wait_for("a fresh paid path", lambda: (lambda r: r if r["ok"] else None)(fetch(4096, timeout=20)),
-             timeout=300, every=5)
+    _, attempts = fresh_path()
     before, circs = money(topo), paid_circuits(topo)
     r = fetch(a.seconds * a.rate, rate=a.rate, timeout=a.seconds + 180)
     after = money(topo)
@@ -914,45 +929,95 @@ def scenario_renewal(a):
     want = a.seconds // 60 - 1
     return verdict("renewal", r["ok"] and rounds >= want and msat == rounds * topo["paid"][nick]
                    and after["payer_sent_msat"] - before["payer_sent_msat"] >= msat,
-                   transfer=r, rounds_settled=rounds, rounds_expected_min=want, relay_received_msat=msat,
+                   fresh_path_attempts=attempts, transfer=r, rounds_settled=rounds, rounds_expected_min=want, relay_received_msat=msat,
                    payer_sent_msat=after["payer_sent_msat"] - before["payer_sent_msat"], circuits_kept=still)
 
 
-def scenario_payer_stop(a):
-    """Stop the payer's CLN mid-circuit: the paid path must close within a round + grace, with no free
-    fallback through the paid-only client and no settlement afterwards. Then restore and prove a new path."""
+def settled(m):
+    """Rounds settled so far: the receiving relays' paid invoices (authoritative for money that moved), or the
+    payer's completed pays when a relay's CLN is down."""
+    if all("paid_invoices" in r for r in m["relays"].values()):
+        return sum(r["paid_invoices"] for r in m["relays"].values())
+    return m["payer_complete"]
+
+
+def fresh_path(tries=3, each=240):
+    """Rescope until a fresh paid path carries a checksummed fetch. Returns (fetch result, attempts). More
+    than one attempt is el-tor/eltord#17's construction race (a relay resync around the first status query)."""
+    for attempt in range(1, tries + 1):
+        cmd_controllers(argparse.Namespace(rescope=True))
+        end = time.time() + each
+        while time.time() < end:
+            r = fetch(4096, timeout=20)
+            if r["ok"]:
+                return r, attempt
+            time.sleep(5)
+        log(f"fresh path attempt {attempt}/{tries} failed")
+    die(f"no fresh paid path after {tries} attempts")
+
+
+def outage(name, a, stop, restore):
+    """Shared shape for fault scenarios: on a fresh paid path, stop one dependency mid-circuit. The paid path
+    must close within --limit seconds, the paid-only client must never fall back to free capacity, nothing
+    may settle while it is down, and after restoring it a fresh path must come back."""
     topo = load_topo()
-    cmd_controllers(argparse.Namespace(rescope=True))
-    first = wait_for("a fresh paid path", lambda: (lambda r: r if r["ok"] else None)(fetch(4096, timeout=20)),
-                     timeout=300, every=5)
-    if not first["ok"]:
-        return verdict("payer-stop", False, why="no working paid path before the test", fetch=first)
-    ln("payer", "stop", timeout=30)
-    stop_recorded("ln-payer", grace=30)
-    t0 = time.time()
-    closed_after = None
+    first, attempts = fresh_path()
+    before = money(topo)
+    stop(topo)
+    t0, closed_after = time.time(), None
     while time.time() - t0 < a.limit:
         if not fetch(4096, timeout=15)["ok"]:
             closed_after = round(time.time() - t0)
             break
         time.sleep(5)
+    # Rounds are funded up to lead_ms (60 s) ahead, so one round already in flight may still settle between
+    # the fault and the closure: that bounded "current + next" exposure is by design. After closure: nothing.
+    at_close = money(topo)
     leaks = [fetch(4096, timeout=15)["ok"] for _ in range(3)] if closed_after is not None else []
-    ln_up("payer", topo["ln"]["payer"]["idx"])
-    frozen = money(topo)
     time.sleep(70)                      # one more round: nothing may settle for the dead path
     later = money(topo)
-    cmd_controllers(argparse.Namespace(rescope=True))
+    restore(topo)
     t1 = time.time()
-    back = wait_for("a fresh paid path after restoring the payer",
-                    lambda: (lambda r: r if r["ok"] else None)(fetch(4096, timeout=20)), timeout=300, every=5)
-    return verdict("payer-stop", closed_after is not None and closed_after <= a.limit and not any(leaks)
-                   and later["payer_complete"] == frozen["payer_complete"],
-                   closed_after_s=closed_after, limit_s=a.limit, free_fallback_hits=sum(leaks),
-                   settled_while_stopped=later["payer_complete"] - frozen["payer_complete"],
-                   restored_after_s=round(time.time() - t1), restored_fetch=back)
+    back, back_attempts = fresh_path()
+    return verdict(name, closed_after is not None and closed_after <= a.limit and not any(leaks)
+                   and settled(later) == settled(at_close),
+                   fresh_path_attempts=attempts, closed_after_s=closed_after, limit_s=a.limit,
+                   free_fallback_hits=sum(leaks),
+                   settled_between_fault_and_close=settled(at_close) - settled(before),
+                   settled_after_close=settled(later) - settled(at_close),
+                   restored_after_s=round(time.time() - t1), restore_attempts=back_attempts, restored_fetch=back)
 
 
-SCENARIOS = {"renewal": scenario_renewal, "payer-stop": scenario_payer_stop}
+def _ln_stop(name):
+    try:
+        ln(name, "stop", timeout=30)
+    except Exception:  # noqa: BLE001 - already down
+        pass
+    stop_recorded(f"ln-{name}", grace=60)
+
+
+def scenario_payer_stop(a):
+    """The client's own wallet (payer CLN) goes away mid-circuit."""
+    return outage("payer-stop", a, lambda t: _ln_stop("payer"),
+                  lambda t: ln_up("payer", t["ln"]["payer"]["idx"]))
+
+
+def scenario_relay_ln_down(a):
+    """A paid relay's receiving CLN goes away: no invoices, no settlement it can see."""
+    nick = next(iter(load_topo()["paid"]))
+    name = f"r{nick}"
+    return outage("relay-ln-down", a, lambda t: _ln_stop(name), lambda t: ln_up(name, t["ln"][name]["idx"]))
+
+
+def scenario_zero_ctl_down(a):
+    """A zero-priced hop's controller dies: zero-charge rounds still need that relay's authorization."""
+    topo = load_topo()
+    nick = next(n for n in topo["path"] if n not in topo["paid"])
+    return outage("zero-ctl-down", a, lambda t: stop_recorded(f"ctl-{nick}"), lambda t: controllers_up(t))
+
+
+SCENARIOS = {"renewal": scenario_renewal, "payer-stop": scenario_payer_stop,
+             "relay-ln-down": scenario_relay_ln_down, "zero-ctl-down": scenario_zero_ctl_down}
 
 
 def cmd_scenario(a):
@@ -982,7 +1047,7 @@ def main():
     s.add_argument("--seconds", type=int, default=900,
                    help="renewal: stream duration (default 15 min: past the round 10->11 renewal by 5 rounds)")
     s.add_argument("--rate", type=int, default=1000, help="renewal: origin pacing in bytes/s")
-    s.add_argument("--limit", type=int, default=150, help="payer-stop: max seconds until the path closes")
+    s.add_argument("--limit", type=int, default=150, help="fault scenarios: max seconds until the path closes")
     s.set_defaults(fn=cmd_scenario)
     s = sub.add_parser("controllers", help="restart every foundation controller")
     s.add_argument("--rescope", action="store_true", help="new client plan scope (fresh construction)")

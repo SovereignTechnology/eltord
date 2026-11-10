@@ -49,11 +49,18 @@ labctl status                               # processes, bootstrap, settlement (
 labctl fetch 1048576                        # checksummed 1 MiB through 005c (paid streams only)
 labctl fetch 65536 --client plain-client    # through 009c on the relays' free allowance
 labctl fetch 600000 --rate 20000            # a slow stream that crosses payment rounds
+labctl scenario renewal                     # 15 min checksummed stream across the round 10->11 renewal
+labctl scenario payer-stop                  # also: relay-ln-down, zero-ctl-down (fault scenarios)
 labctl ln payer listpays                    # any lightning-cli call on any lab node
 labctl mine 6
 labctl ctl 006m GETINFO status/bootstrap-phase
 labctl down && labctl wipe
 ```
+
+Each scenario prints one JSON line with `"result": "PASS"|"FAIL"` and its evidence. Fault scenarios stop one
+dependency on a fresh paid path. The path must close within `--limit` seconds (default 150), with no free fallback
+through the paid-only client and nothing settled after the close; then a fresh path must come back. One round
+funded ahead (`lead_ms`) may settle between the fault and the close, by design, and is reported separately.
 
 `up` is idempotent. On a fresh state it mines and funds the chain, opens channels, creates offers and runes,
 configures Chutney, appends the El Tor lines to each torrc, provisions every ledger, starts Tor and the
