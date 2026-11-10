@@ -1,0 +1,830 @@
+#!/usr/bin/env python3
+"""labctl: a hermetic El Tor regtest test network on one Linux host or VM.
+
+Everything listens on loopback: bitcoind (regtest), one Core Lightning node per foundation relay plus a
+payer and a routing hub, an el-tor Chutney network (directory authorities, foundation relays, a
+foundation client) and a checksummed HTTP origin. Real regtest Lightning settles every paid round, so
+positive-price circuits, renewal, payment stop and recovery can be exercised without real funds.
+
+Stdlib only. State lives under $ELTOR_LAB_STATE (default /lab); see testnet/README.md.
+"""
+import argparse
+import base64
+import hashlib
+import http.server
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STATE = Path(os.environ.get("ELTOR_LAB_STATE", "/lab"))
+CHUTNEY = Path(os.environ.get("ELTOR_LAB_CHUTNEY", "/src/chutney"))
+ELTOR_BIN = Path(os.environ.get("ELTOR_LAB_BIN", "/opt/eltor/bin"))
+BTC_BIN = Path(os.environ.get("ELTOR_LAB_BITCOIN", "/opt/bitcoin/bin"))
+CLN_BIN = Path(os.environ.get("ELTOR_LAB_CLN", "/opt/cln/usr/bin"))
+
+BTC_DIR = STATE / "btc"
+LN_DIR = STATE / "ln"
+NET_DIR = STATE / "net"          # CHUTNEY_DATA_DIR
+FDN_DIR = STATE / "foundation"   # private controller configs + ledgers
+LOG_DIR = STATE / "logs"
+PID_DIR = STATE / "pids"
+TOPO = STATE / "lab.json"
+
+BTC_RPC_PORT = 18443
+LN_P2P_BASE = 19800
+LN_REST_BASE = 13100
+ORIGIN_PORT = 18880
+ORIGIN_HOST = "127.0.0.1"        # no relay listens here, so no exit-enclave shortcut
+
+
+# ----------------------------------------------------------------------------------------------- utils
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%SZ', time.gmtime())}] {msg}", flush=True)
+
+
+def die(msg, code=1):
+    log(f"ABORT: {msg}")
+    sys.exit(code)
+
+
+def run(cmd, check=True, capture=True, env=None, cwd=None, timeout=120):
+    r = subprocess.run([str(c) for c in cmd], capture_output=capture, text=True, env=env, cwd=cwd,
+                       timeout=timeout)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"{Path(str(cmd[0])).name} {' '.join(map(str, cmd[1:3]))}... exit {r.returncode}: "
+                           f"{(r.stderr or r.stdout or '').strip()[-600:]}")
+    return r
+
+
+def wait_for(what, fn, timeout=120, every=1.0):
+    end = time.time() + timeout
+    last = None
+    while time.time() < end:
+        try:
+            v = fn()
+            if v:
+                return v
+        except Exception as e:  # noqa: BLE001 - surfaced on timeout
+            last = e
+        time.sleep(every)
+    die(f"timed out after {timeout}s waiting for {what}" + (f" (last error: {last})" if last else ""))
+
+
+def private_write(path, data, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(path.name + ".new")
+    if tmp.exists():
+        tmp.unlink()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, "w" if isinstance(data, str) else "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def spawn(name, cmd, env=None, cwd=None):
+    """Start a long-lived process in its own session; its pid goes to pids/<name>.pid."""
+    PID_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    out = open(LOG_DIR / f"{name}.log", "ab")
+    p = subprocess.Popen([str(c) for c in cmd], stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         env=env, cwd=cwd, start_new_session=True)
+    (PID_DIR / f"{name}.pid").write_text(str(p.pid))
+    return p.pid
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # A zombie still answers kill(0).
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().split(") ")[-1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def recorded(name):
+    try:
+        return int((PID_DIR / f"{name}.pid").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def stop_recorded(name, sig=signal.SIGTERM, grace=15):
+    """Stop only a pid this harness recorded itself (never a pgrep match)."""
+    pid = recorded(name)
+    if pid and pid_alive(pid):
+        os.kill(pid, sig)
+        end = time.time() + grace
+        while time.time() < end and pid_alive(pid):
+            time.sleep(0.2)
+        if pid_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+    (PID_DIR / f"{name}.pid").unlink(missing_ok=True)
+
+
+def load_topo():
+    if not TOPO.exists():
+        die("no lab.json: run `labctl up` first")
+    return json.loads(TOPO.read_text())
+
+
+def save_topo(t):
+    private_write(TOPO, json.dumps(t, indent=2, sort_keys=True) + "\n")
+
+
+# --------------------------------------------------------------------------------------------- bitcoind
+def btc(*args, wallet=None, timeout=60):
+    cmd = [BTC_BIN / "bitcoin-cli", "-regtest", f"-datadir={BTC_DIR}", f"-rpcport={BTC_RPC_PORT}"]
+    if wallet:
+        cmd.append(f"-rpcwallet={wallet}")
+    r = run(cmd + list(args), timeout=timeout)
+    out = r.stdout.strip()
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return out
+
+
+def btc_up():
+    BTC_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    conf = BTC_DIR / "bitcoin.conf"
+    if not conf.exists():
+        private_write(conf, "\n".join([
+            "regtest=1", "server=1", "listen=0", "txindex=1", "fallbackfee=0.0002",
+            "[regtest]", f"rpcport={BTC_RPC_PORT}", "rpcbind=127.0.0.1", "rpcallowip=127.0.0.1",
+            "printtoconsole=0", ""]))
+    try:
+        btc("getblockcount", timeout=5)
+        return
+    except Exception:  # noqa: BLE001 - not running yet
+        pass
+    run([BTC_BIN / "bitcoind", f"-datadir={BTC_DIR}", "-daemon"])
+    wait_for("bitcoind RPC", lambda: isinstance(btc("getblockcount", timeout=5), int), timeout=60)
+    wallets = btc("listwallets")
+    if "lab" not in wallets:
+        try:
+            btc("loadwallet", "lab")
+        except RuntimeError:
+            btc("createwallet", "lab")
+    if btc("getblockcount") < 101:
+        mine(101 - btc("getblockcount"))
+    log(f"bitcoind regtest up: height {btc('getblockcount')}, wallet {btc('getbalance', wallet='lab')} BTC")
+
+
+def mine(n=1):
+    addr = btc("getnewaddress", wallet="lab")
+    btc("generatetoaddress", str(n), addr, timeout=120)
+    return btc("getblockcount")
+
+
+# ------------------------------------------------------------------------------------- Core Lightning
+def ln_dir(name):
+    return LN_DIR / name
+
+
+def ln(name, method, *args, timeout=60, **kw):
+    """lightning-cli for one node; keyword args become -k params (key=value)."""
+    cmd = [CLN_BIN / "lightning-cli", f"--lightning-dir={ln_dir(name)}", "--network=regtest"]
+    if kw:
+        cmd += ["-k", method] + [f"{k}={v if isinstance(v, str) else json.dumps(v)}" for k, v in kw.items()]
+    else:
+        cmd += [method] + [a if isinstance(a, str) else json.dumps(a) for a in args]
+    r = run(cmd, timeout=timeout)
+    out = r.stdout.strip()
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return out
+
+
+def ln_conf(name, idx, fee_base_msat=0, fee_ppm=0):
+    return "\n".join([
+        "network=regtest",
+        f"alias={name}",
+        f"bitcoin-cli={BTC_BIN / 'bitcoin-cli'}",
+        f"bitcoin-datadir={BTC_DIR}",
+        f"bitcoin-rpcport={BTC_RPC_PORT}",
+        f"bind-addr=127.0.0.1:{LN_P2P_BASE + idx}",
+        f"log-file={ln_dir(name) / 'lightningd.log'}",
+        "log-level=debug",
+        # clnrest: plain HTTP is accepted by eltord only on numeric loopback.
+        f"clnrest-port={LN_REST_BASE + idx}",
+        "clnrest-host=127.0.0.1",
+        "clnrest-protocol=http",
+        "disable-plugin=cln-grpc",
+        "disable-plugin=wss-proxy",
+        f"fee-base={fee_base_msat}",
+        f"fee-per-satoshi={fee_ppm}",
+        # Regtest pacing: poll bitcoind every second and gossip without the mainnet delays.
+        "developer",
+        "dev-bitcoind-poll=1",
+        "dev-fast-gossip",
+        "",
+    ])
+
+
+def ln_up(name, idx, **fees):
+    d = ln_dir(name)
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not (d / "config").exists():
+        private_write(d / "config", ln_conf(name, idx, **fees))
+    try:
+        ln(name, "getinfo", timeout=5)
+        return
+    except Exception:  # noqa: BLE001 - not running yet
+        pass
+    # Not --daemon: a daemonized lightningd keeps the caller's stdout pipe open, so a captured run never returns.
+    spawn(f"ln-{name}", [CLN_BIN / "lightningd", f"--lightning-dir={d}"])
+    wait_for(f"{name} getinfo", lambda: ln(name, "getinfo", timeout=5).get("id"), timeout=90)
+
+
+def ln_id(name):
+    return ln(name, "getinfo")["id"]
+
+
+def ln_channels_normal(name, n):
+    peers = ln(name, "listpeerchannels").get("channels", [])
+    return sum(1 for c in peers if c.get("state") == "CHANNELD_NORMAL") >= n
+
+
+def ln_fund_and_connect(topo):
+    """Fund the payer, then one direct, announced channel payer -> each paid relay's CLN (fee 0), so
+    fetchinvoice's onion messages and the payment both have a one-hop path."""
+    nodes = topo["ln"]
+    paid_ln = [topo["relay_ln"][nick] for nick in topo["paid"]]
+    if not ln("payer", "listfunds")["outputs"]:
+        addr = ln("payer", "newaddr")    # CLN >= 24 answers {"p2tr": ...} by default, older {"bech32": ...}
+        btc("sendtoaddress", addr.get("p2tr") or addr["bech32"], "2", wallet="lab")
+        mine(1)
+        wait_for("payer wallet funds",
+                 lambda: any(o.get("status") == "confirmed" for o in ln("payer", "listfunds")["outputs"]), 120)
+
+    def has_channel(b):
+        return any(c.get("peer_id") == nodes[b]["id"] and c.get("state") in ("CHANNELD_AWAITING_LOCKIN", "CHANNELD_NORMAL")
+                   for c in ln("payer", "listpeerchannels")["channels"])
+
+    for b in paid_ln:
+        ln("payer", "connect", nodes[b]["id"], "127.0.0.1", str(nodes[b]["p2p"]))
+        if not has_channel(b):
+            ln("payer", "fundchannel", id=nodes[b]["id"], amount=topo["channel_sat"], announce=True)
+    if not paid_ln:
+        return
+    mine(6)
+    wait_for("payer channels CHANNELD_NORMAL", lambda: ln_channels_normal("payer", len(paid_ln)), timeout=180)
+    mine(6)  # announcement depth, so the relay nodes can build blinded paths through the payer
+    wait_for("payer gossip to see every channel",
+             lambda: len({c["short_channel_id"] for c in ln("payer", "listchannels")["channels"]}) >= len(paid_ln),
+             timeout=180, every=2)
+    log(f"lightning: {len(paid_ln)} direct channel(s) payer -> paid relay CLN, normal and gossiped")
+
+
+# ---------------------------------------------------------------------------------------- HTTP origin
+def payload(n, seed):
+    """Deterministic bytes: sha256 counter stream, so any size is checkable without storing it."""
+    out = bytearray()
+    i = 0
+    while len(out) < n:
+        out += hashlib.sha256(f"{seed}:{i}".encode()).digest()
+        i += 1
+    return bytes(out[:n])
+
+
+class Origin(http.server.BaseHTTPRequestHandler):
+    """GET /bytes/<n>?seed=<s>[&rate=<bytes per second>] -> payload; header X-Sha256 carries its digest."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("origin %s %s\n" % (self.address_string(), fmt % args))
+
+    def do_GET(self):
+        m = re.fullmatch(r"/bytes/(\d{1,9})(?:\?seed=([A-Za-z0-9_-]{1,64})(?:&rate=(\d{1,9}))?)?", self.path)
+        if not m:
+            self.send_error(404)
+            return
+        n, seed, rate = int(m.group(1)), m.group(2) or "x", int(m.group(3) or 0)
+        body = payload(n, seed)
+        self.send_response(200)
+        self.send_header("Content-Length", str(n))
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("X-Sha256", hashlib.sha256(body).hexdigest())
+        self.end_headers()
+        step = max(1, rate // 10) if rate else len(body) or 1
+        for i in range(0, len(body), step):
+            self.wfile.write(body[i:i + step])
+            if rate:
+                time.sleep(step / rate)
+
+
+class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def origin_serve():
+    ThreadingServer((ORIGIN_HOST, ORIGIN_PORT), Origin).serve_forever()
+
+
+def origin_up():
+    if recorded("origin") and pid_alive(recorded("origin")):
+        return
+    spawn("origin", [sys.executable, "-I", Path(__file__).resolve(), "_origin"])
+    wait_for("HTTP origin", lambda: socket.create_connection((ORIGIN_HOST, ORIGIN_PORT), 1).close() or True, 20)
+
+
+# ----------------------------------------------------------------------------------------- tor control
+class Control:
+    """Minimal Tor control-port client (password or cookie auth)."""
+
+    def __init__(self, port, password=None, cookie=None, timeout=30):
+        self.s = socket.create_connection(("127.0.0.1", port), timeout)
+        self.f = self.s.makefile("rb")
+        if password is not None:
+            self.cmd(f'AUTHENTICATE "{password}"')
+        elif cookie is not None:
+            self.cmd("AUTHENTICATE " + Path(cookie).read_bytes().hex())
+        else:
+            self.cmd("AUTHENTICATE")
+
+    def cmd(self, line):
+        self.s.sendall(line.encode() + b"\r\n")
+        lines = []
+        while True:
+            raw = self.f.readline()
+            if not raw:
+                raise RuntimeError("control connection closed")
+            text = raw.decode(errors="replace").rstrip("\r\n")
+            lines.append(text)
+            if len(text) >= 4 and text[3] == "+":          # data block until "."
+                while True:
+                    d = self.f.readline().decode(errors="replace").rstrip("\r\n")
+                    if d == ".":
+                        break
+                    lines.append(d)
+            elif len(text) >= 4 and text[3] == " ":
+                break
+        if not lines[-1].startswith("250"):
+            raise RuntimeError(f"{line.split()[0]}: {lines[-1]}")
+        return lines
+
+    def close(self):
+        try:
+            self.s.sendall(b"QUIT\r\n")
+        except OSError:
+            pass
+        self.s.close()
+
+
+# --------------------------------------------------------------------------------------------- chutney
+def chutney_env():
+    env = dict(os.environ)
+    path = [str(CHUTNEY / "lib"), str(CHUTNEY / "scripts")]
+    if sys.version_info >= (3, 12):
+        path.append(str(HERE / "pyshim"))    # asyncore/asynchat import stubs (see pyshim/asyncore.py)
+    env.update({
+        "PYTHONPATH": ":".join(path),
+        "CHUTNEY_PATH": str(CHUTNEY),
+        "CHUTNEY_DATA_DIR": str(NET_DIR),
+        "CHUTNEY_TOR": str(ELTOR_BIN / "tor"),
+        "CHUTNEY_TOR_GENCERT": str(ELTOR_BIN / "tor-gencert"),
+        "CHUTNEY_DNS_CONF": "/dev/null",        # offline: exits never resolve
+        "CHUTNEY_TOR_SANDBOX": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",          # the chutney checkout may be read-only
+    })
+    return env
+
+
+def chutney(verb, timeout=300):
+    return run([sys.executable, "-m", "chutney.TorNet", verb, STATE / "flavor.py"], env=chutney_env(),
+               cwd=CHUTNEY, timeout=timeout)
+
+
+def flavor(topo):
+    """Chutney network file in basic-min's numbering (000a-003a, 004r, 005c, 006m-008m) plus an ordinary
+    client 009c. Distinct loopback addresses keep Tor's exit-enclave hint away from the origin on 127.0.0.1."""
+    kinds = {
+        "authority": 'tag="a", authority=1, relay=1, torrc="authority.tmpl"',
+        "exit": 'tag="r", relay=1, exit=1, torrc="relay.tmpl"',
+        "middle": 'tag="m", relay=1, torrc="relay.tmpl"',
+        "client": 'tag="c", client=1, torrc="client.tmpl"',
+        "plain-client": 'tag="c", client=1, torrc="client.tmpl"',
+    }
+    lines = [f'Node({kinds[n["role"]]}, ip="{n["ip"]}")' for n in topo["nodes"]]
+    return "NODES = [\n    " + ",\n    ".join(lines) + "\n]\nConfigureNodes(NODES)\n"
+
+
+def node_dirs():
+    """chutney node dirs in nodenum order: [(nodenum, tag, Path)]."""
+    out = []
+    nodes = NET_DIR / "nodes"
+    for d in sorted(nodes.iterdir()) if nodes.is_dir() else []:
+        m = re.fullmatch(r"(\d{3})([a-z]+)", d.name)
+        if m and d.is_dir():
+            out.append((int(m.group(1)), m.group(2), d))
+    return out
+
+
+def node_port(nodenum, kind):
+    return {"or": 5055, "dir": 7055, "control": 8055, "socks": 9055}[kind] + nodenum
+
+
+def fingerprint(d):
+    return (d / "fingerprint").read_text().split()[1].lower()
+
+
+def hash_password(pw):
+    r = run([ELTOR_BIN / "tor", "--quiet", "--hash-password", pw])
+    h = r.stdout.strip().splitlines()[-1]
+    if not h.startswith("16:"):
+        die("tor --hash-password gave no 16: hash")
+    return h
+
+
+def torrc_append(d, marker, lines):
+    """Idempotently replace this harness's block at the end of a node's torrc."""
+    p = d / "torrc"
+    text = p.read_text()
+    begin, end = f"# >>> labctl {marker}", f"# <<< labctl {marker}"
+    text = re.sub(rf"\n?{re.escape(begin)}.*?{re.escape(end)}\n?", "\n", text, flags=re.S)
+    p.write_text(text.rstrip("\n") + "\n" + "\n".join([begin, *lines, end]) + "\n")
+
+
+def tor_control(nodenum, password=None):
+    d = dict((n, p) for n, _, p in node_dirs())[nodenum]
+    if password is None:
+        return Control(node_port(nodenum, "control"), cookie=d / "control_auth_cookie")
+    return Control(node_port(nodenum, "control"), password=password)
+
+
+def bootstrap_pct(nodenum, topo):
+    c = tor_control(nodenum, topo["control_password"])
+    try:
+        line = c.cmd("GETINFO status/bootstrap-phase")[0]
+        m = re.search(r"PROGRESS=(\d+)", line)
+        return int(m.group(1)) if m else 0
+    finally:
+        c.close()
+
+
+# ------------------------------------------------------------------------------------------ foundation
+RELAY_ROLES = ("authority", "exit", "middle")
+RECEIVING_RUNE = [["method=getinfo", "method=help", "method=listinvoices"]]
+PAYER_RUNE = [["method=getinfo", "method=help", "method=fetchinvoice", "method=pay", "method=listpays"]]
+
+
+def eltor_terms(rate_msat, grace_ms=15000, paid_quota_bytes=0, max_periods=3, handshake_fee_msat=0,
+                setup_timeout_ms=30000):
+    """ElTorFoundationTerms: canonical finite v1 policy terms, 55 bytes as 110 lowercase hex (eltor
+    src/feature/payment/payment_profile.c encoder, eltord spec/01a_circuit_renewal_wire.md). A round is
+    fixed at 60 s and a period at 10 rounds; max_age covers every period."""
+    import struct
+    b = struct.pack(">BBBQIIIQQIQI", 1, 1, 10, rate_msat, 60000, 60000, grace_ms, paid_quota_bytes,
+                    max_periods * 600000, max_periods, handshake_fee_msat, setup_timeout_ms)
+    assert len(b) == 55
+    return b.hex()
+
+
+def new_topo(paid, path, periods):
+    nodes = [{"role": "authority", "ip": f"127.0.1.{i + 1}"} for i in range(4)]
+    nodes.append({"role": "exit", "ip": "127.0.2.1"})
+    nodes.append({"role": "client", "ip": "127.0.3.1"})          # foundation client: paid streams only
+    nodes += [{"role": "middle", "ip": f"127.0.2.{i + 2}"} for i in range(3)]
+    nodes.append({"role": "plain-client", "ip": "127.0.3.2"})    # ordinary client: free allowance only
+    tags = {"authority": "a", "exit": "r", "middle": "m", "client": "c", "plain-client": "c"}
+    for n, d in enumerate(nodes):
+        d["num"], d["nick"] = n, f"{n:03d}{tags[d['role']]}"
+    relays = [d["nick"] for d in nodes if d["role"] in RELAY_ROLES]
+    for nick in list(paid) + list(path):
+        if nick not in relays:
+            die(f"{nick} is not a relay (relays: {' '.join(relays)})")
+    lnodes = {"payer": {"idx": 0}, "zero": {"idx": 1}}
+    relay_ln = {}
+    for i, nick in enumerate(sorted(paid)):
+        lnodes[f"r{nick}"] = {"idx": 2 + i}
+        relay_ln[nick] = f"r{nick}"
+    for nick in relays:
+        relay_ln.setdefault(nick, "zero")          # zero-priced relays share one receiving node, as upstream did
+    for d in lnodes.values():
+        d["p2p"], d["rest"] = LN_P2P_BASE + d["idx"], LN_REST_BASE + d["idx"]
+    return {
+        "nodes": nodes, "relays": relays, "paid": paid, "path": path, "periods": periods,
+        "ln": lnodes, "relay_ln": relay_ln, "offers": {}, "channel_sat": 1_000_000,
+        "control_password": secrets.token_hex(16), "scope": secrets.token_hex(32),
+        "routing_fee_per_hop_msat": 5000, "clock_uncertainty_ms": 1000,
+    }
+
+
+def node(topo, nick):
+    for d in topo["nodes"]:
+        if d["nick"] == nick:
+            return d
+    die(f"no node {nick}")
+
+
+def rune_file(name):
+    return FDN_DIR / "runes" / name
+
+
+def ensure_runes(topo):
+    for name in topo["ln"]:
+        f = rune_file(name)
+        if not f.exists():
+            rune = ln(name, "createrune", restrictions=PAYER_RUNE if name == "payer" else RECEIVING_RUNE)["rune"]
+            private_write(f, rune)
+
+
+def account_json(topo, lname, ledger):
+    d = topo["ln"][lname]
+    return json.dumps({
+        "ledger_path": ledger, "node_id": d["id"], "chain": "regtest",
+        "cln_url": f"http://127.0.0.1:{d['rest']}", "cln_rune": rune_file(lname).read_text().strip(),
+        "clock_uncertainty_ms": topo["clock_uncertainty_ms"],
+    }, indent=2) + "\n"
+
+
+def client_plan(topo):
+    fps = [fingerprint(NET_DIR / "nodes" / nick) for nick in topo["path"]]
+    rates = [topo["paid"].get(nick, 0) for nick in topo["path"]]
+    fee = topo["routing_fee_per_hop_msat"]
+    per_round = sum(rates) + fee * sum(1 for r in rates if r > 0)
+    return {
+        "scope": topo["scope"], "fingerprints": fps,
+        "per_round_msat": per_round, "routing_fee_per_hop_msat": fee,
+        "outstanding_msat": 3 * per_round, "lifetime_msat": 100 * per_round,
+    }
+
+
+def write_foundation(topo):
+    """Private controller files: control password, one account JSON + ledger per relay, payer + plan."""
+    pw = FDN_DIR / "control-password"
+    if not pw.exists():
+        private_write(pw, topo["control_password"] + "\n")
+    (FDN_DIR / "relays" / "ledger").mkdir(parents=True, exist_ok=True, mode=0o700)
+    (FDN_DIR / "client" / "ledger").mkdir(parents=True, exist_ok=True, mode=0o700)
+    for nick in topo["relays"]:
+        cfg = FDN_DIR / "relays" / f"{nick}.json"
+        private_write(cfg, account_json(topo, topo["relay_ln"][nick], f"ledger/{nick}.sqlite"))
+        if not (FDN_DIR / "relays" / "ledger" / f"{nick}.sqlite").exists():
+            run([ELTOR_BIN / "eltor-foundation-ledger", "provision", "--config", cfg], timeout=120)
+    payer = FDN_DIR / "client" / "payer.json"
+    private_write(payer, account_json(topo, "payer", "ledger/payer.sqlite"))
+    if not (FDN_DIR / "client" / "ledger" / "payer.sqlite").exists():
+        run([ELTOR_BIN / "eltor-foundation-payer-ledger", "--config", payer], timeout=120)
+    private_write(FDN_DIR / "client" / "plan.json", json.dumps(client_plan(topo), indent=2) + "\n")
+    log(f"foundation: {len(topo['relays'])} relay ledgers + payer ledger provisioned, plan for "
+        f"{' -> '.join(topo['path'])}")
+
+
+def patch_torrcs(topo):
+    pwhash = hash_password(topo["control_password"])
+    dirs = {d.name: d for _, _, d in node_dirs()}
+    for d in topo["nodes"]:
+        lines = [f"HashedControlPassword {pwhash}", "UseMicrodescriptors 0"]
+        if d["role"] != "plain-client":
+            lines.append("ElTorFoundation 1")
+        if d["nick"] in topo["paid"]:
+            lines += [f"ElTorFoundationTerms {eltor_terms(topo['paid'][d['nick']], max_periods=topo['periods'])}",
+                      f"PaymentBolt12Offer {topo['offers'][d['nick']]}"]
+        if d["role"] == "client":
+            lines += ["__ElTorRequirePaidStreams 1", "UseEntryGuards 0", "LearnCircuitBuildTimeout 0",
+                      "CircuitBuildTimeout 15"]
+        torrc_append(dirs[d["nick"]], "foundation", lines)
+
+
+def controllers_up(topo):
+    pw = FDN_DIR / "control-password"
+    env = dict(os.environ, RUST_LOG=os.environ.get("RUST_LOG", "info"))
+    for nick in topo["relays"]:
+        if not (recorded(f"ctl-{nick}") and pid_alive(recorded(f"ctl-{nick}"))):
+            spawn(f"ctl-{nick}", [ELTOR_BIN / "eltor-foundation-relay", "--control",
+                                  f"127.0.0.1:{node_port(node(topo, nick)['num'], 'control')}", "--password-file", pw,
+                                  "--foundation-config", FDN_DIR / "relays" / f"{nick}.json"], env=env)
+    client = next(d for d in topo["nodes"] if d["role"] == "client")
+    if not (recorded("ctl-client") and pid_alive(recorded("ctl-client"))):
+        spawn("ctl-client", [ELTOR_BIN / "eltor-foundation-client", "--control",
+                             f"127.0.0.1:{node_port(client['num'], 'control')}", "--password-file", pw,
+                             "--foundation-config", FDN_DIR / "client" / "payer.json",
+                             "--client-plan", FDN_DIR / "client" / "plan.json"], env=env)
+
+
+# ----------------------------------------------------------------------------------------------- fetch
+def fetch(nbytes, client="client", seed=None, rate=0, timeout=120):
+    """GET a checksummed payload from the origin through a client's SOCKS port. Returns a result dict."""
+    topo = load_topo()
+    d = next(x for x in topo["nodes"] if x["role"] == client)
+    seed = seed or secrets.token_hex(4)
+    url = f"http://{ORIGIN_HOST}:{ORIGIN_PORT}/bytes/{nbytes}?seed={seed}" + (f"&rate={rate}" if rate else "")
+    out = STATE / "tmp" / f"fetch-{seed}"
+    out.parent.mkdir(exist_ok=True)
+    t0 = time.time()
+    r = subprocess.run(["curl", "-sS", "--max-time", str(timeout), "--socks5-hostname",
+                        f"127.0.0.1:{node_port(d['num'], 'socks')}", "-o", str(out), "-w", "%{http_code}", url],
+                       capture_output=True, text=True)
+    secs = time.time() - t0
+    body = out.read_bytes() if out.exists() else b""
+    out.unlink(missing_ok=True)
+    ok = r.returncode == 0 and r.stdout == "200" and body == payload(nbytes, seed)
+    return {"ok": ok, "client": client, "bytes": len(body), "want": nbytes, "http": r.stdout or "000",
+            "curl_exit": r.returncode, "secs": round(secs, 1), "err": r.stderr.strip()[-200:]}
+
+
+# ----------------------------------------------------------------------------------------------- money
+def money(topo):
+    """Settlement evidence straight from CLN: what the payer completed vs what each paid relay received."""
+    pays = [p for p in ln("payer", "listpays")["pays"] if p.get("status") == "complete"]
+    sent = sum(int(str(p.get("amount_sent_msat", 0)).removesuffix("msat")) for p in pays)
+    out = {"payer_complete": len(pays), "payer_sent_msat": sent, "relays": {}}
+    for nick in topo["paid"]:
+        inv = [i for i in ln(topo["relay_ln"][nick], "listinvoices")["invoices"] if i.get("status") == "paid"]
+        out["relays"][nick] = {"paid_invoices": len(inv), "received_msat": sum(
+            int(str(i.get("amount_received_msat", 0)).removesuffix("msat")) for i in inv)}
+    return out
+
+
+# --------------------------------------------------------------------------------------------- commands
+def cmd_up(a):
+    for d in (STATE, LN_DIR, FDN_DIR, LOG_DIR, PID_DIR):
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    paid = {}
+    for p in a.paid or ["006m:1000"]:
+        nick, _, rate = p.partition(":")
+        paid[nick] = int(rate or 1000)
+    path = a.path.split(",") if a.path else ["006m", "007m", "004r"]
+    if TOPO.exists():
+        topo = load_topo()
+        if (a.paid and topo["paid"] != paid) or (a.path and topo["path"] != path):
+            die("this lab already has a different paid set/path: `labctl down && labctl wipe` first")
+    else:
+        topo = new_topo(paid, path, a.periods)
+        save_topo(topo)
+    origin_up()
+    btc_up()
+    for name, d in topo["ln"].items():
+        ln_up(name, d["idx"])
+        d["id"] = ln_id(name)
+        wait_for(f"{name} clnrest", lambda d=d: socket.create_connection(("127.0.0.1", d["rest"]), 1).close() or True, 60)
+    save_topo(topo)
+    ln_fund_and_connect(topo)
+    for nick in topo["paid"]:
+        if not topo["offers"].get(nick):
+            topo["offers"][nick] = ln(topo["relay_ln"][nick], "offer", amount="any",
+                                      description=f"El Tor relay {nick}")["bolt12"]
+    save_topo(topo)
+    ensure_runes(topo)
+    if not (NET_DIR / "nodes").is_dir():
+        private_write(STATE / "flavor.py", flavor(topo))
+        chutney("configure")
+        patch_torrcs(topo)
+        log(f"chutney: configured {len(topo['nodes'])} nodes")
+    write_foundation(topo)
+    chutney("start")
+    # The ordinary client 009c is a test subject (free allowance through foundation relays), not
+    # infrastructure: up waits for everything else and only reports it.
+    want = [d["num"] for d in topo["nodes"] if d["role"] != "plain-client"]
+    wait_for("relays + foundation client bootstrapped to 100%",
+             lambda: all(bootstrap_pct(n, topo) == 100 for n in want), timeout=a.timeout, every=3)
+    plain = next(d for d in topo["nodes"] if d["role"] == "plain-client")
+    log(f"tor: relays + 005c bootstrapped; ordinary client {plain['nick']} at {bootstrap_pct(plain['num'], topo)}%")
+    controllers_up(topo)
+    log("controllers: relays + client attached; probing the paid path through 005c")
+    t0 = time.time()
+    res = wait_for("a checksummed fetch through the paid-only client", lambda: (lambda r: r if r["ok"] else None)(
+        fetch(4096, timeout=30)), timeout=a.timeout, every=5)
+    log(f"PAID PATH UP after {time.time() - t0:.0f}s: {json.dumps(res)}")
+    log(f"settlement: {json.dumps(money(topo))}")
+
+
+def cmd_down(a):
+    for f in sorted(PID_DIR.glob("ctl-*.pid")) if PID_DIR.is_dir() else []:
+        stop_recorded(f.stem)
+    if (NET_DIR / "nodes").is_dir() and (STATE / "flavor.py").exists():
+        try:
+            chutney("stop", timeout=120)
+        except Exception as e:  # noqa: BLE001 - keep tearing down
+            log(f"chutney stop: {e}")
+    if TOPO.exists():
+        for name in load_topo()["ln"]:
+            try:
+                ln(name, "stop", timeout=30)
+            except Exception:  # noqa: BLE001 - not running
+                pass
+    try:
+        btc("stop", timeout=30)
+    except Exception:  # noqa: BLE001 - not running
+        pass
+    stop_recorded("origin")
+    log("lab down")
+
+
+def cmd_status(a):
+    topo = load_topo()
+    print(f"chain height: {btc('getblockcount')}")
+    for f in sorted(PID_DIR.glob("*.pid")):
+        pid = recorded(f.stem)
+        print(f"proc {f.stem:<14} pid {pid} {'up' if pid and pid_alive(pid) else 'DOWN'}")
+    for d in topo["nodes"]:
+        try:
+            pct = bootstrap_pct(d["num"], topo)
+        except Exception as e:  # noqa: BLE001
+            pct = f"? ({e})"
+        price = topo["paid"].get(d["nick"])
+        print(f"tor  {d['nick']} {d['role']:<12} {d['ip']:<10} bootstrap {pct}"
+              + (f"  paid {price} msat/round" if price else ""))
+    print(f"path: {' -> '.join(topo['path'])}")
+    print(f"settlement: {json.dumps(money(topo))}")
+
+
+def cmd_wipe(a):
+    alive = [f.stem for f in PID_DIR.glob("*.pid") if recorded(f.stem) and pid_alive(recorded(f.stem))] \
+        if PID_DIR.is_dir() else []
+    if alive:
+        die(f"still running: {' '.join(alive)} (labctl down first)")
+    for child in STATE.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    log(f"wiped {STATE}")
+
+
+def cmd_controllers(a):
+    """Restart every foundation controller (RUST_LOG is passed through). --rescope gives the client a fresh
+    plan scope: a claimed scope is only ever reconciled, never rebuilt."""
+    topo = load_topo()
+    for f in sorted(PID_DIR.glob("ctl-*.pid")):
+        stop_recorded(f.stem)
+    if a.rescope:
+        topo["scope"] = secrets.token_hex(32)
+        save_topo(topo)
+        private_write(FDN_DIR / "client" / "plan.json", json.dumps(client_plan(topo), indent=2) + "\n")
+    controllers_up(topo)
+    log(f"controllers restarted{' with a fresh client scope' if a.rescope else ''} (RUST_LOG={os.environ.get('RUST_LOG', 'info')})")
+
+
+def cmd_fetch(a):
+    r = fetch(a.bytes, client=a.client, rate=a.rate, timeout=a.timeout)
+    print(json.dumps(r))
+    sys.exit(0 if r["ok"] else 1)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="labctl", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("up", help="build/start the whole network and prove a paid fetch")
+    s.add_argument("--paid", action="append", metavar="NICK:MSAT", help="paid relay and its rate (default 006m:1000)")
+    s.add_argument("--path", metavar="A,B,C", help="client path, guard..exit (default 006m,007m,004r)")
+    s.add_argument("--periods", type=int, default=3, help="10-round periods per circuit (default 3 = 30 min)")
+    s.add_argument("--timeout", type=int, default=600)
+    s.set_defaults(fn=cmd_up)
+    sub.add_parser("down", help="stop everything this harness started").set_defaults(fn=cmd_down)
+    sub.add_parser("status", help="processes, bootstrap, settlement").set_defaults(fn=cmd_status)
+    sub.add_parser("wipe", help="delete all lab state (after down)").set_defaults(fn=cmd_wipe)
+    s = sub.add_parser("controllers", help="restart every foundation controller")
+    s.add_argument("--rescope", action="store_true", help="new client plan scope (fresh construction)")
+    s.set_defaults(fn=cmd_controllers)
+    s = sub.add_parser("fetch", help="checksummed GET through a client's SOCKS port")
+    s.add_argument("bytes", type=int)
+    s.add_argument("--client", choices=["client", "plain-client"], default="client")
+    s.add_argument("--rate", type=int, default=0, help="origin pacing, bytes/s")
+    s.add_argument("--timeout", type=int, default=120)
+    s.set_defaults(fn=cmd_fetch)
+    s = sub.add_parser("ln", help="lightning-cli on a lab node: ln <node> <method> [args]")
+    s.add_argument("node")
+    s.add_argument("args", nargs="+")
+    s.set_defaults(fn=lambda a: print(json.dumps(ln(a.node, *a.args), indent=2)))
+    s = sub.add_parser("btc", help="bitcoin-cli on the regtest node")
+    s.add_argument("args", nargs="+")
+    s.set_defaults(fn=lambda a: print(json.dumps(btc(*a.args), indent=2)))
+    s = sub.add_parser("mine", help="mine N regtest blocks")
+    s.add_argument("n", type=int, nargs="?", default=1)
+    s.set_defaults(fn=lambda a: print(mine(a.n)))
+    s = sub.add_parser("ctl", help="one Tor control command on a node: ctl <nick> <command...>")
+    s.add_argument("nick")
+    s.add_argument("command", nargs="+")
+    s.set_defaults(fn=lambda a: [print(x) for x in (lambda t, c: (c.cmd(" ".join(a.command)), c.close())[0])(
+        load_topo(), tor_control(node(load_topo(), a.nick)["num"], load_topo()["control_password"]))])
+    sub.add_parser("_origin").set_defaults(fn=lambda a: origin_serve())
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
