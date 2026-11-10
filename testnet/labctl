@@ -29,7 +29,7 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-STATE = Path(os.environ.get("ELTOR_LAB_STATE", "/lab"))
+STATE = Path(os.environ.get("ELTOR_LAB_STATE") or "/lab")
 CHUTNEY = Path(os.environ.get("ELTOR_LAB_CHUTNEY", "/src/chutney"))
 ELTOR_BIN = Path(os.environ.get("ELTOR_LAB_BIN", "/opt/eltor/bin"))
 BTC_BIN = Path(os.environ.get("ELTOR_LAB_BITCOIN", "/opt/bitcoin/bin"))
@@ -48,6 +48,9 @@ LN_P2P_BASE = 19800
 LN_REST_BASE = 13100
 ORIGIN_PORT = 18880
 ORIGIN_HOST = "127.0.0.1"        # no relay listens here, so no exit-enclave shortcut
+
+
+MARKER = ".eltor-lab"                  # written by `up`; `wipe` refuses a directory without it
 
 
 # ----------------------------------------------------------------------------------------------- utils
@@ -83,6 +86,25 @@ def wait_for(what, fn, timeout=120, every=1.0):
     die(f"timed out after {timeout}s waiting for {what}" + (f" (last error: {last})" if last else ""))
 
 
+def state_ok(create=False):
+    """STATE must be an absolute, non-root, real directory owned by us and closed to group/other: chutney
+    exec()s STATE/flavor.py and the harness signals pids recorded there."""
+    if not STATE.is_absolute() or STATE == Path("/") or STATE.parent == STATE:
+        die(f"ELTOR_LAB_STATE must be an absolute directory other than /, not {str(STATE)!r}")
+    if create and not os.path.lexists(STATE):
+        STATE.mkdir(parents=True, mode=0o700)
+    try:
+        st = os.lstat(STATE)
+    except FileNotFoundError:
+        die(f"{STATE} does not exist (labctl up creates it)")
+    import stat as _stat
+    if not _stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        die(f"{STATE} must be a real directory (not a symlink) owned by uid {os.geteuid()}")
+    if st.st_mode & 0o022:
+        die(f"{STATE} is group/other writable: refusing (chmod 0700 it after checking its contents)")
+    os.chmod(STATE, 0o700)
+
+
 def private_write(path, data, mode=0o600):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -102,8 +124,17 @@ def spawn(name, cmd, env=None, cwd=None):
     out = open(LOG_DIR / f"{name}.log", "ab")
     p = subprocess.Popen([str(c) for c in cmd], stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                          env=env, cwd=cwd, start_new_session=True)
-    (PID_DIR / f"{name}.pid").write_text(str(p.pid))
+    (PID_DIR / f"{name}.pid").write_text(f"{p.pid} {start_time(p.pid)}\n")
     return p.pid
+
+
+def start_time(pid):
+    """Field 22 of /proc/<pid>/stat (start time in clock ticks), or None."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(") ", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
 
 
 def pid_alive(pid):
@@ -122,10 +153,13 @@ def pid_alive(pid):
 
 
 def recorded(name):
+    """The recorded pid, only while that same process (same start time) is still the one running."""
     try:
-        return int((PID_DIR / f"{name}.pid").read_text())
+        pid, started = (PID_DIR / f"{name}.pid").read_text().split()
+        pid, started = int(pid), int(started)
     except (OSError, ValueError):
         return None
+    return pid if start_time(pid) == started else None
 
 
 def stop_recorded(name, sig=signal.SIGTERM, grace=15):
@@ -298,19 +332,33 @@ def ln_fund_and_connect(topo):
 
 
 # ---------------------------------------------------------------------------------------- HTTP origin
-def payload(n, seed):
-    """Deterministic bytes: sha256 counter stream, so any size is checkable without storing it."""
-    out = bytearray()
-    i = 0
-    while len(out) < n:
-        out += hashlib.sha256(f"{seed}:{i}".encode()).digest()
-        i += 1
-    return bytes(out[:n])
+ORIGIN_MAX = 64 * 1024 * 1024          # bytes per response
+
+
+def payload_chunks(n, seed, chunk=65536):
+    """Deterministic bytes (a sha256 counter stream), generated in chunks: never held whole in memory."""
+    i, left, buf = 0, n, bytearray()
+    while left > 0:
+        while len(buf) < min(chunk, left):
+            buf += hashlib.sha256(f"{seed}:{i}".encode()).digest()
+            i += 1
+        take = min(chunk, left)
+        yield bytes(buf[:take])
+        del buf[:take]
+        left -= take
+
+
+def payload_sha256(n, seed):
+    h = hashlib.sha256()
+    for c in payload_chunks(n, seed):
+        h.update(c)
+    return h.hexdigest()
 
 
 class Origin(http.server.BaseHTTPRequestHandler):
     """GET /bytes/<n>?seed=<s>[&rate=<bytes per second>] -> payload; header X-Sha256 carries its digest."""
     protocol_version = "HTTP/1.1"
+    timeout = 30
 
     def log_message(self, fmt, *args):
         sys.stderr.write("origin %s %s\n" % (self.address_string(), fmt % args))
@@ -321,17 +369,19 @@ class Origin(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
             return
         n, seed, rate = int(m.group(1)), m.group(2) or "x", int(m.group(3) or 0)
-        body = payload(n, seed)
+        if n > ORIGIN_MAX or (rate and rate < 100):
+            self.send_error(400, f"at most {ORIGIN_MAX} bytes and rate >= 100 B/s")
+            return
         self.send_response(200)
         self.send_header("Content-Length", str(n))
         self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("X-Sha256", hashlib.sha256(body).hexdigest())
+        self.send_header("X-Sha256", payload_sha256(n, seed))
         self.end_headers()
-        step = max(1, rate // 10) if rate else len(body) or 1
-        for i in range(0, len(body), step):
-            self.wfile.write(body[i:i + step])
+        step = max(100, rate // 10) if rate else 65536
+        for c in payload_chunks(n, seed, step):
+            self.wfile.write(c)
             if rate:
-                time.sleep(step / rate)
+                time.sleep(len(c) / rate)
 
 
 class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -375,7 +425,10 @@ class Control:
             lines.append(text)
             if len(text) >= 4 and text[3] == "+":          # data block until "."
                 while True:
-                    d = self.f.readline().decode(errors="replace").rstrip("\r\n")
+                    raw = self.f.readline()
+                    if not raw:
+                        raise RuntimeError("control connection closed inside a data block")
+                    d = raw.decode(errors="replace").rstrip("\r\n")
                     if d == ".":
                         break
                     lines.append(d)
@@ -451,11 +504,15 @@ def fingerprint(d):
 
 
 def hash_password(pw):
-    r = run([ELTOR_BIN / "tor", "--quiet", "--hash-password", pw])
-    h = r.stdout.strip().splitlines()[-1]
-    if not h.startswith("16:"):
-        die("tor --hash-password gave no 16: hash")
-    return h
+    """Tor's HashedControlPassword: OpenPGP iterated+salted S2K over SHA-1 (RFC 4880 3.7.1.3), count byte
+    0x60 = 65536 bytes, as `tor --hash-password` does, but without putting the password in argv."""
+    salt, c = secrets.token_bytes(8), 0x60
+    count = (16 + (c & 15)) << ((c >> 4) + 6)
+    data, h = salt + pw.encode(), hashlib.sha1()
+    while count > 0:
+        h.update(data[:count])
+        count -= min(count, len(data))
+    return "16:" + (salt + bytes([c])).hex().upper() + h.hexdigest().upper()
 
 
 def torrc_append(d, marker, lines):
@@ -593,10 +650,22 @@ def write_foundation(topo):
         f"{' -> '.join(topo['path'])}")
 
 
+def pin_listeners(torrc, ip):
+    """Chutney's templates bind ORPort/DirPort on every interface. Bind each to the node's own loopback
+    address, so nothing outside this host can reach the network. Exit policies stay as Chutney writes them:
+    narrowing them to the origin (accept 127.0.0.1:18880 only) leaves the client with no exit it considers
+    usable ("Found 0 servers that might support 0/1 pending connections"), so no stream ever attaches."""
+    text = torrc.read_text()
+    text = re.sub(r"(?mi)^(OrPort)\s+(\d+)\s*$", rf"\1 {ip}:\2 IPv4Only", text)
+    text = re.sub(r"(?mi)^(DirPort)\s+(\d+)\s*$", rf"\1 {ip}:\2", text)
+    torrc.write_text(text)
+
+
 def patch_torrcs(topo):
-    pwhash = hash_password(topo["control_password"])
+    pwhash = topo.setdefault("control_hash", hash_password(topo["control_password"]))
     dirs = {d.name: d for _, _, d in node_dirs()}
     for d in topo["nodes"]:
+        pin_listeners(dirs[d["nick"]] / "torrc", d["ip"])
         lines = [f"HashedControlPassword {pwhash}", "UseMicrodescriptors 0"]
         if d["role"] != "plain-client":
             lines.append("ElTorFoundation 1")
@@ -641,7 +710,8 @@ def fetch(nbytes, client="client", seed=None, rate=0, timeout=120):
     secs = time.time() - t0
     body = out.read_bytes() if out.exists() else b""
     out.unlink(missing_ok=True)
-    ok = r.returncode == 0 and r.stdout == "200" and body == payload(nbytes, seed)
+    ok = r.returncode == 0 and r.stdout == "200" and len(body) == nbytes and \
+        hashlib.sha256(body).hexdigest() == payload_sha256(nbytes, seed)
     return {"ok": ok, "client": client, "bytes": len(body), "want": nbytes, "http": r.stdout or "000",
             "curl_exit": r.returncode, "secs": round(secs, 1), "err": r.stderr.strip()[-200:]}
 
@@ -661,7 +731,9 @@ def money(topo):
 
 # --------------------------------------------------------------------------------------------- commands
 def cmd_up(a):
-    for d in (STATE, LN_DIR, FDN_DIR, LOG_DIR, PID_DIR):
+    state_ok(create=True)
+    (STATE / MARKER).touch()
+    for d in (LN_DIR, FDN_DIR, LOG_DIR, PID_DIR):
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
     paid = {}
     for p in a.paid or ["006m:1000"]:
@@ -692,8 +764,9 @@ def cmd_up(a):
     if not (NET_DIR / "nodes").is_dir():
         private_write(STATE / "flavor.py", flavor(topo))
         chutney("configure")
-        patch_torrcs(topo)
         log(f"chutney: configured {len(topo['nodes'])} nodes")
+    patch_torrcs(topo)                  # idempotent; takes effect at the next tor start
+    save_topo(topo)
     write_foundation(topo)
     chutney("start")
     # The ordinary client 009c is a test subject (free allowance through foundation relays), not
@@ -726,10 +799,14 @@ def cmd_down(a):
                 ln(name, "stop", timeout=30)
             except Exception:  # noqa: BLE001 - not running
                 pass
+            stop_recorded(f"ln-{name}", grace=60)   # `stop` returns before lightningd has exited
     try:
         btc("stop", timeout=30)
     except Exception:  # noqa: BLE001 - not running
         pass
+    end = time.time() + 120             # bitcoind flushes its chain on the way out: wait for it
+    while time.time() < end and listening(BTC_RPC_PORT):
+        time.sleep(1)
     stop_recorded("origin")
     log("lab down")
 
@@ -752,9 +829,22 @@ def cmd_status(a):
     print(f"settlement: {json.dumps(money(topo))}")
 
 
+def listening(port):
+    try:
+        socket.create_connection(("127.0.0.1", port), 0.5).close()
+        return True
+    except OSError:
+        return False
+
+
 def cmd_wipe(a):
-    alive = [f.stem for f in PID_DIR.glob("*.pid") if recorded(f.stem) and pid_alive(recorded(f.stem))] \
-        if PID_DIR.is_dir() else []
+    state_ok()
+    if not (STATE / MARKER).is_file():
+        die(f"{STATE} has no {MARKER} marker: not a labctl state directory, refusing to delete it")
+    alive = [f.stem for f in PID_DIR.glob("*.pid") if recorded(f.stem)] if PID_DIR.is_dir() else []
+    ports = [BTC_RPC_PORT, ORIGIN_PORT] + [LN_REST_BASE + i for i in range(16)] + \
+        [node_port(n, "control") for n in range(16)]
+    alive += [f"port {p}" for p in ports if listening(p)]
     if alive:
         die(f"still running: {' '.join(alive)} (labctl down first)")
     for child in STATE.iterdir():
@@ -772,11 +862,101 @@ def cmd_controllers(a):
     for f in sorted(PID_DIR.glob("ctl-*.pid")):
         stop_recorded(f.stem)
     if a.rescope:
+        # The old scope's paid circuit would stay BUILT, unfunded, and still eligible for new streams until
+        # its relays close it a round later: close the client's circuits so only the new scope carries traffic.
+        client = next(d for d in topo["nodes"] if d["role"] == "client")
+        c = tor_control(client["num"], topo["control_password"])
+        try:
+            for cid in paid_circuits(topo):
+                try:
+                    c.cmd(f"CLOSECIRCUIT {cid}")
+                except RuntimeError:
+                    pass                    # already gone
+        finally:
+            c.close()
         topo["scope"] = secrets.token_hex(32)
         save_topo(topo)
         private_write(FDN_DIR / "client" / "plan.json", json.dumps(client_plan(topo), indent=2) + "\n")
     controllers_up(topo)
     log(f"controllers restarted{' with a fresh client scope' if a.rescope else ''} (RUST_LOG={os.environ.get('RUST_LOG', 'info')})")
+
+
+def paid_circuits(topo):
+    """BUILT circuit ids on the foundation client (its paid path carries the user streams)."""
+    client = next(d for d in topo["nodes"] if d["role"] == "client")
+    c = tor_control(client["num"], topo["control_password"])
+    try:
+        rows = c.cmd("GETINFO circuit-status")
+    finally:
+        c.close()
+    return sorted(r.split()[0] for r in rows[1:] if " BUILT " in f" {r} " and r.split()[0].isdigit())
+
+
+def verdict(name, ok, **evidence):
+    print(json.dumps({"scenario": name, "result": "PASS" if ok else "FAIL", **evidence}))
+    return ok
+
+
+def scenario_renewal(a):
+    """One slow checksummed stream across a 10-round payment period on the same circuit."""
+    topo = load_topo()
+    nick = next(iter(topo["paid"]))
+    # Start from a fresh construction so the stream covers rounds 1..N of one known circuit.
+    cmd_controllers(argparse.Namespace(rescope=True))
+    wait_for("a fresh paid path", lambda: (lambda r: r if r["ok"] else None)(fetch(4096, timeout=20)),
+             timeout=300, every=5)
+    before, circs = money(topo), paid_circuits(topo)
+    r = fetch(a.seconds * a.rate, rate=a.rate, timeout=a.seconds + 180)
+    after = money(topo)
+    rounds = after["relays"][nick]["paid_invoices"] - before["relays"][nick]["paid_invoices"]
+    msat = after["relays"][nick]["received_msat"] - before["relays"][nick]["received_msat"]
+    still = sorted(set(circs) & set(paid_circuits(topo)))
+    want = a.seconds // 60 - 1
+    return verdict("renewal", r["ok"] and rounds >= want and msat == rounds * topo["paid"][nick]
+                   and after["payer_sent_msat"] - before["payer_sent_msat"] >= msat,
+                   transfer=r, rounds_settled=rounds, rounds_expected_min=want, relay_received_msat=msat,
+                   payer_sent_msat=after["payer_sent_msat"] - before["payer_sent_msat"], circuits_kept=still)
+
+
+def scenario_payer_stop(a):
+    """Stop the payer's CLN mid-circuit: the paid path must close within a round + grace, with no free
+    fallback through the paid-only client and no settlement afterwards. Then restore and prove a new path."""
+    topo = load_topo()
+    cmd_controllers(argparse.Namespace(rescope=True))
+    first = wait_for("a fresh paid path", lambda: (lambda r: r if r["ok"] else None)(fetch(4096, timeout=20)),
+                     timeout=300, every=5)
+    if not first["ok"]:
+        return verdict("payer-stop", False, why="no working paid path before the test", fetch=first)
+    ln("payer", "stop", timeout=30)
+    stop_recorded("ln-payer", grace=30)
+    t0 = time.time()
+    closed_after = None
+    while time.time() - t0 < a.limit:
+        if not fetch(4096, timeout=15)["ok"]:
+            closed_after = round(time.time() - t0)
+            break
+        time.sleep(5)
+    leaks = [fetch(4096, timeout=15)["ok"] for _ in range(3)] if closed_after is not None else []
+    ln_up("payer", topo["ln"]["payer"]["idx"])
+    frozen = money(topo)
+    time.sleep(70)                      # one more round: nothing may settle for the dead path
+    later = money(topo)
+    cmd_controllers(argparse.Namespace(rescope=True))
+    t1 = time.time()
+    back = wait_for("a fresh paid path after restoring the payer",
+                    lambda: (lambda r: r if r["ok"] else None)(fetch(4096, timeout=20)), timeout=300, every=5)
+    return verdict("payer-stop", closed_after is not None and closed_after <= a.limit and not any(leaks)
+                   and later["payer_complete"] == frozen["payer_complete"],
+                   closed_after_s=closed_after, limit_s=a.limit, free_fallback_hits=sum(leaks),
+                   settled_while_stopped=later["payer_complete"] - frozen["payer_complete"],
+                   restored_after_s=round(time.time() - t1), restored_fetch=back)
+
+
+SCENARIOS = {"renewal": scenario_renewal, "payer-stop": scenario_payer_stop}
+
+
+def cmd_scenario(a):
+    sys.exit(0 if SCENARIOS[a.name](a) else 1)
 
 
 def cmd_fetch(a):
@@ -797,6 +977,13 @@ def main():
     sub.add_parser("down", help="stop everything this harness started").set_defaults(fn=cmd_down)
     sub.add_parser("status", help="processes, bootstrap, settlement").set_defaults(fn=cmd_status)
     sub.add_parser("wipe", help="delete all lab state (after down)").set_defaults(fn=cmd_wipe)
+    s = sub.add_parser("scenario", help="run a named end-to-end scenario; prints one PASS/FAIL JSON line")
+    s.add_argument("name", choices=sorted(SCENARIOS))
+    s.add_argument("--seconds", type=int, default=900,
+                   help="renewal: stream duration (default 15 min: past the round 10->11 renewal by 5 rounds)")
+    s.add_argument("--rate", type=int, default=1000, help="renewal: origin pacing in bytes/s")
+    s.add_argument("--limit", type=int, default=150, help="payer-stop: max seconds until the path closes")
+    s.set_defaults(fn=cmd_scenario)
     s = sub.add_parser("controllers", help="restart every foundation controller")
     s.add_argument("--rescope", action="store_true", help="new client plan scope (fresh construction)")
     s.set_defaults(fn=cmd_controllers)
@@ -823,6 +1010,8 @@ def main():
         load_topo(), tor_control(node(load_topo(), a.nick)["num"], load_topo()["control_password"]))])
     sub.add_parser("_origin").set_defaults(fn=lambda a: origin_serve())
     a = p.parse_args()
+    if a.cmd not in ("up", "_origin"):
+        state_ok()
     a.fn(a)
 
 
